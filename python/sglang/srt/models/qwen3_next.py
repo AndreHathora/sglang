@@ -28,7 +28,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -243,6 +243,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         self,
         config: Qwen3NextConfig,
         layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
@@ -282,6 +283,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_qkvz,
             bias=False,
+            quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -289,6 +291,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             input_size=self.hidden_size,
             output_size=projection_size_ba,
             bias=False,
+            quant_config=None,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
@@ -340,6 +343,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.value_dim,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             input_is_parallel=True,
             reduce_results=False,
             tp_rank=self.attn_tp_rank,
@@ -527,7 +531,9 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.linear_attn = Qwen3GatedDeltaNet(config, layer_id, alt_stream)
+        self.linear_attn = Qwen3GatedDeltaNet(
+            config, layer_id, quant_config, alt_stream
+        )
 
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
@@ -969,7 +975,7 @@ class Qwen3NextForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",

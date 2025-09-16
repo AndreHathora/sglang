@@ -79,6 +79,8 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetLoadReqInput,
+    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -114,6 +116,7 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     MultimodalInputs,
     Req,
+    RequestStage,
     ScheduleBatch,
     global_server_args_dict,
 )
@@ -577,6 +580,7 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
+                (GetLoadReqInput, self.get_load),
             ]
         )
 
@@ -1178,6 +1182,16 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_pyobj(output)
 
+    def init_req_max_new_tokens(self, req):
+        req.sampling_params.max_new_tokens = min(
+            (
+                req.sampling_params.max_new_tokens
+                if req.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_len - len(req.origin_input_ids) - 1,
+        )
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1219,6 +1233,9 @@ class Scheduler(
                 bootstrap_room=recv_req.bootstrap_room,
                 data_parallel_rank=recv_req.data_parallel_rank,
                 vocab_size=self.model_config.vocab_size,
+                metrics_collector=(
+                    self.metrics_collector if self.enable_metrics else None
+                ),
             )
             req.tokenizer = self.tokenizer
 
@@ -1241,6 +1258,7 @@ class Scheduler(
                 req.set_finish_with_abort(
                     f"Invalid request: session id {recv_req.session_params.id} does not exist"
                 )
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
         else:
@@ -1248,6 +1266,7 @@ class Scheduler(
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
             if isinstance(req.finished_reason, FINISH_ABORT):
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
 
@@ -1267,8 +1286,12 @@ class Scheduler(
                         f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
                     )
                 )
+                self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        # initialize before returning
+        self.init_req_max_new_tokens(req)
 
         # Validate prompt length
         error_msg = validate_input_length(
@@ -1302,15 +1325,6 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
-
-        req.sampling_params.max_new_tokens = min(
-            (
-                req.sampling_params.max_new_tokens
-                if req.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req.origin_input_ids) - 1,
-        )
 
         # Init grammar cache for this request
         add_to_grammar_queue = False
@@ -1758,6 +1772,7 @@ class Scheduler(
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:
                 req.queue_time_end = time.perf_counter()
+                req.add_latency(RequestStage.PREFILL_WAITING)
 
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
@@ -2279,39 +2294,50 @@ class Scheduler(
             if_success = False
         return if_success
 
-    def get_load(self):
+    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
         # TODO(lsyin): use dynamically maintained num_waiting_tokens
+
         if self.is_hybrid:
-            load_full = (
+            num_tokens_full = (
                 self.full_tokens_per_layer
                 - self.token_to_kv_pool_allocator.full_available_size()
                 - self.tree_cache.full_evictable_size()
             )
-            load_swa = (
+            num_tokens_swa = (
                 self.swa_tokens_per_layer
                 - self.token_to_kv_pool_allocator.swa_available_size()
                 - self.tree_cache.swa_evictable_size()
             )
-            load = max(load_full, load_swa)
+            num_tokens = max(num_tokens_full, num_tokens_swa)
         else:
-            load = (
+            num_tokens = (
                 self.max_total_num_tokens
                 - self.token_to_kv_pool_allocator.available_size()
                 - self.tree_cache.evictable_size()
             )
-        load += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+
+        # Tokens in waiting queue, bootstrap queue, prealloc queue
+        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        num_waiting_reqs = len(self.waiting_queue)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            load += sum(
+            num_tokens += sum(
                 len(req.origin_input_ids)
                 for req in self.disagg_prefill_bootstrap_queue.queue
             )
+            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            load += sum(
+            num_tokens += sum(
                 len(req.req.origin_input_ids)
                 for req in self.disagg_decode_prealloc_queue.queue
             )
+            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
 
-        return load
+        return GetLoadReqOutput(
+            dp_rank=self.dp_rank,
+            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            num_tokens=num_tokens,
+        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
@@ -2336,8 +2362,6 @@ class Scheduler(
             )
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
-
-        ret["load"] = self.get_load()
 
         return GetInternalStateReqOutput(internal_state=ret)
 
