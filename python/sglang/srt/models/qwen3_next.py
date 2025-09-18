@@ -11,6 +11,7 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
 )
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.fla.layernorm_gated import rmsnorm_fn
@@ -44,7 +45,14 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
+from sglang.srt.utils import (
+    LazyValue,
+    add_prefix,
+    is_cuda,
+    is_npu,
+    make_layers,
+    set_weight_attrs,
+)
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -883,13 +891,14 @@ class Qwen3NextModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                layer_id=i,
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                hidden_states, residual = layer(
+                    layer_id=i,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -934,6 +943,18 @@ class Qwen3NextForCausalLM(nn.Module):
         )
         self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: layer.mlp.get_moe_weights()
+                for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+            }
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     @torch.no_grad()
     def forward(
